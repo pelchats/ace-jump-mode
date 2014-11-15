@@ -188,6 +188,9 @@ The default value is set to the same as `case-fold-search'.")
 (defvar ace-jump-mode-mark-ring-max 100
   "The max length of `ace-jump-mode-mark-ring'")
 
+;;TODO: set to nil by default
+(defvar ace-jump-two-char-selection t
+  "If non-nil, display two selection characters at a time")
 
 (defvar ace-jump-mode-gray-background t
   "By default, when there is more than one candidate, the ace
@@ -311,6 +314,13 @@ that `ace-jump-search-candidate' will use as an additional filter.")
 Normally, the ace jump mark cannot be seen if the target character is invisible.
 So default to be nil, which will not include those invisible character as candidate.")
 
+(defun ace-jump-num-char-selection ()
+  "Number of selection characters to display."
+  (if (and ace-jump-two-char-selection
+           (not (eq ace-jump-current-mode
+                    'ace-jump-char-mode)))
+      2
+    1))
 
 (defun ace-jump-char-category ( query-char )
   "Detect the type of the char.
@@ -368,9 +378,9 @@ The returned value is a list of `aj-position' record."
                                     (> (point) end-point)
                                     (eobp))
                              if (and (or ace-jump-allow-invisible (not (invisible-p (match-beginning 0))))
-                                  (or (null ace-jump-search-filter)
-                                      (ignore-errors
-                                        (funcall ace-jump-search-filter))))
+				     (or (null ace-jump-search-filter)
+					 (ignore-errors
+					   (funcall ace-jump-search-filter))))
                              collect (make-aj-position :offset (match-beginning 0)
                                                        :visual-area va)
                              ;; when we use "^" to search line mode,
@@ -425,115 +435,130 @@ while a child node list when type is 'branch"
   "we move over tree via preorder, and call BRANCH-FUNC on each branch
 node and call LEAF-FUNC on each leaf node"
   ;; use stack to do preorder traverse
-  (let ((s (list tree)))
+  (let ((s (list (cons tree 0))))
     (while (not (null s))
       ;; pick up one from stack
-      (let ((node (car s)))
-        ;; update stack
-        (setq s (cdr s))
-        (cond
-         ((eq (car node) 'branch)
-          ;; a branch node
-          (when branch-func
-            (funcall branch-func node))
-          ;; push all child node into stack
-          (setq s (append (cdr node) s)))
-         ((eq (car node) 'leaf)
-          (when leaf-func
-            (funcall leaf-func node)))
-         (t
-          (message "[AceJump] Internal Error: invalid tree node type")))))))
+      (let ((depth (cdr (car s)))
+	    (node (car (car s))))
+	;; update stack
+	(setq s (cdr s))
+	(cond
+	 ((eq (car node) 'branch)
+	  ;; a branch node
+	  (when branch-func
+	    (funcall branch-func node))
+	  ;; push all child node into stack
+	  (setq s (append (mapcar (lambda (n) (cons n (1+ depth))) (cdr node)) s)))
+	 ((eq (car node) 'leaf)
+	  (when leaf-func
+	    (funcall leaf-func node depth)))
+	 (t
+	  (message "[AceJump] Internal Error: invalid tree node type")))))))
 
 
 (defun ace-jump-populate-overlay-to-search-tree (tree candidate-list)
   "Populate the overlay to search tree, every leaf will give one overlay"
-  
+
   (lexical-let* (;; create the locally dynamic variable for the following function
                  (position-list candidate-list)
-                 
+
                  ;; make the function to create overlay for each leaf node,
                  ;; here we only create each overlay for each candidate
                  ;; position, , but leave the 'display property to be empty,
                  ;; which will be fill in "update-overlay" function
-                 (func-create-overlay (lambda (node)
-                                        (let* ((p (car position-list))
-                                               (o (aj-position-offset p))
-                                               (w (aj-position-window p))
-                                               (b (aj-position-buffer p))
-                                               ;; create one char overlay
-                                               (ol (make-overlay o (1+ o) b)))
-                                          ;; update leaf node to remember the ol
-                                          (setf (cdr node) ol)
-                                          (overlay-put ol 'face 'ace-jump-face-foreground)
-                                          ;; this is important, because sometimes the different
-                                          ;; window may dispaly the same buffer, in that case, 
-                                          ;; overlay for different window (but the same buffer)
-                                          ;; will show at the same time on both window
-                                          ;; So we make it only on the specific window
-                                          (overlay-put ol 'window w)
-                                          ;; associate the aj-position data with overlay
-                                          ;; so that we can use it to do the final jump
-                                          (overlay-put ol 'aj-data p)
-                                          ;; next candidate node
-                                          (setq position-list (cdr position-list))))))
+                 (func-create-overlay (lambda (node depth)
+					(let* ((p (car position-list))
+					       (o (aj-position-offset p))
+					       (w (aj-position-window p))
+					       (b (aj-position-buffer p))
+					       ;; create one or two char overlay
+					       ;;TODO: only one char for char mode
+					       (ol (make-overlay o (+ o (min depth (ace-jump-num-char-selection))) b)))
+					  ;; update leaf node to remember the ol
+					  (setf (cdr node) ol)
+					  (overlay-put ol 'face 'ace-jump-face-foreground)
+					  ;; this is important, because sometimes the different
+					  ;; window may display the same buffer, in that case,
+					  ;; overlay for different window (but the same buffer)
+					  ;; will show at the same time on both window
+					  ;; So we make it only on the specific window
+					  (overlay-put ol 'window w)
+					  ;; associate the aj-position data with overlay
+					  ;; so that we can use it to do the final jump
+					  (overlay-put ol 'aj-data p)
+					  ;; next candidate node
+					  (setq position-list (cdr position-list))))))
     (ace-jump-tree-preorder-traverse tree func-create-overlay)
     tree))
 
 
 (defun ace-jump-delete-overlay-in-search-tree (tree)
   "Delete all the overlay in search tree leaf node"
-  (let ((func-delete-overlay (lambda (node)
+  (let ((func-delete-overlay (lambda (node depth)
                                (delete-overlay (cdr node))
                                (setf (cdr node) nil))))
     (ace-jump-tree-preorder-traverse tree func-delete-overlay)))
 
-(defun ace-jump-buffer-substring (pos)
+(defun ace-jump-buffer-substring (pos width)
+  ;;TODO: fix doc string
   "Get the char under the POS, which is aj-position structure."
   (let* ((w (aj-position-window pos))
          (offset (aj-position-offset pos)))
     (with-selected-window w
-      (buffer-substring offset (1+ offset)))))
+      (buffer-substring offset (+ offset width)))))
 
-(defun ace-jump-update-overlay-in-search-tree (tree keys)
+(defun ace-jump-overlay-string (key subs)
+  ;;TODO: doc string
+  ""
+  (concat key
+          (cond ((string-match "\n" subs)
+                 ;; don't keep anything after a newline
+                 "\n")
+                ((string-equal (substring subs 0 1) "\t")
+                 ;; add padding for tab in first position
+                 (let ((pad (- tab-width (length key))))
+                   (when (> pad 0)
+                     (concat (make-string pad ? ) (substring subs 1)))))
+                ((string-equal (substring subs 1) "\t")
+                 ;; add padding for tab in second position
+                 (make-string (-1 (- tab-width (length key))) ? ))
+                ;; there are wide-width characters so, we need padding
+                ((make-string (max 0 (- (string-width subs) (length key))) ? )))))
+
+(defun ace-jump-update-overlay-in-search-tree (tree keys &optional prefix)
   "Update overlay 'display property using each name in keys"
   (lexical-let* (;; create dynamic variable for following function
-                 (key ?\0)
-                 ;; populdate each leaf node to be the specific key,
-                 ;; this only update 'display' property of overlay,
-                 ;; so that user can see the key from screen and select
-                 (func-update-overlay
-                  (lambda (node)
-                    (let ((ol (cdr node)))
-                      (overlay-put
-                       ol
-                       'display
-                       (concat (make-string 1 key)
-                               (let* ((pos (overlay-get ol 'aj-data))
-                                      (subs (ace-jump-buffer-substring pos)))
-                                 (cond
-                                  ;; when tab, we use more space to prevent screen
-                                  ;; from messing up
-                                  ((string-equal subs "\t")
-                                   (make-string (1- tab-width) ? ))
-                                  ;; when enter, we need to add one more enter
-                                  ;; to make the screen not change
-                                  ((string-equal subs "\n")
-                                   "\n")
-                                  (t
-                                   ;; there are wide-width characters
-                                   ;; so, we need paddings
-                                   (make-string (max 0 (1- (string-width subs))) ? ))))))))))
+		 (key (string ?\0))
+		 ;; populate each leaf node to be the specific key,
+		 ;; this only update 'display' property of overlay,
+		 ;; so that user can see the key from screen and select
+		 (func-update-overlay
+		  (lambda (node &optional depth)
+		    (let ((ol (cdr node)))
+		      (overlay-put
+		       ol
+		       'display
+                       (let* ((pos (overlay-get ol 'aj-data))
+                              (ov-size (- (overlay-end ol) (overlay-start ol)))
+                              (subs (ace-jump-buffer-substring pos ov-size)))
+                         (ace-jump-overlay-string key subs)))))))
     (loop for k in keys
           for n in (cdr tree)
           do (progn
                ;; update "key" variable so that the function can use
                ;; the correct context
-               (setq key k)
+               (if prefix
+                   (setq key (concat prefix (string k)))
+                 (setq key (string k)))
                (if (eq (car n) 'branch)
-                   (ace-jump-tree-preorder-traverse n
-                                                    func-update-overlay)
+                   (if (or prefix
+                           (= 1 (ace-jump-num-char-selection)))
+                       ;; don't display more characters
+                       (ace-jump-tree-preorder-traverse n
+                                                        func-update-overlay)
+                     ;; add a second character
+                     (ace-jump-update-overlay-in-search-tree n keys key))
                  (funcall func-update-overlay n))))))
-
 
 
 (defun ace-jump-list-visual-area()
@@ -558,7 +583,7 @@ node and call LEAF-FUNC on each leaf node"
                                        :window w
                                        :frame (selected-frame))))
    ((eq ace-jump-mode-scope 'window)
-    (list 
+    (list
      (make-aj-visual-area :buffer (current-buffer)
                           :window (selected-window)
                           :frame  (selected-frame))))
@@ -659,7 +684,7 @@ You can constrol whether use the case sensitive via `ace-jump-mode-case-fold'.
     (if (and (frame-live-p frame)
              (not (eq frame (selected-frame))))
         (select-frame-set-input-focus (window-frame window)))
-    
+
     ;; select the correct window
     (if (and (window-live-p window)
              (not (eq window (selected-window))))
@@ -705,7 +730,7 @@ You can constrol whether use the case sensitive via `ace-jump-mode-case-fold'.
               (not (buffer-live-p (aj-position-buffer
                                    (car ace-jump-mode-mark-ring)))))
     (setq ace-jump-mode-mark-ring (cdr ace-jump-mode-mark-ring)))
-    
+
   (if (null ace-jump-mode-mark-ring)
       ;; no valid history exist
       (error "[AceJump] No more history"))
@@ -726,9 +751,9 @@ You can constrol whether use the case sensitive via `ace-jump-mode-case-fold'.
                   (move-marker (car mark-ring) nil)
                   (setq mark-ring (cdr mark-ring))
                   (deactivate-mark))
-              
+
               ;;  But if there is other marker put before the wanted destination, the following scenario
-              ;;                                                           
+              ;;
               ;;             +---+---+---+---+                                   +---+---+---+---+
               ;;   Mark Ring | 2 | 3 | 4 | 5 |                                   | 2 | 4 | 5 | 3 |
               ;;             +---+---+---+---+                                   +---+---+---+---+
@@ -738,17 +763,17 @@ You can constrol whether use the case sensitive via `ace-jump-mode-case-fold'.
               ;;             +---+                                               +---+
               ;;   Cursor    | X |                     Pop up AJ mark 3          | 3 | <-- Cursor position
               ;;             +---+                                               +---+
-              ;;             +---+---+---+                                       +---+---+---+ 
+              ;;             +---+---+---+                                       +---+---+---+
               ;;   AJ Ring   | 3 | 4 | 5 |                                       | 4 | 5 | 3 |
               ;;             +---+---+---+                                       +---+---+---+
-              ;;   
+              ;;
               ;; So what we need to do, is put the found mark in mark-ring to the end
               (lexical-let ((po (aj-position-offset p)))
                 (setq mark-ring
                       (ace-jump-move-first-to-end-if mark-ring
                                                      (lambda (x)
                                                        (equal (marker-position x) po))))))
-              
+
 
           ;; when we jump back to another buffer, do as the
           ;; pop-global-mark does. But we move the marker with the
@@ -758,8 +783,8 @@ You can constrol whether use the case sensitive via `ace-jump-mode-case-fold'.
                   (ace-jump-move-first-to-end-if global-mark-ring
                                                  (lambda (x)
                                                    (eq (marker-buffer x) pb))))))))
-          
-  
+
+
   ;; move the first element to the end of the ring
   (ace-jump-jump-to (car ace-jump-mode-mark-ring))
   (setq ace-jump-mode-mark-ring (nconc (cdr ace-jump-mode-mark-ring)
@@ -800,7 +825,7 @@ word-mode and char-mode"
   ;; when you trigger the key for ace jump again when already in ace
   ;; jump mode.  So we stop the previous one first.
   (if ace-jump-current-mode (ace-jump-done))
-  
+
   (if (eq (ace-jump-char-category query-char) 'other)
     (error "[AceJump] Non-printable character"))
 
@@ -858,7 +883,7 @@ Marked each no empty line and move there"
   ;; when you trigger the key for ace jump again when already in ace
   ;; jump mode.  So we stop the previous one first.
   (if ace-jump-current-mode (ace-jump-done))
-  
+
   (setq ace-jump-current-mode 'ace-jump-line-mode)
   (ace-jump-do "^"))
 
@@ -927,7 +952,7 @@ You can constrol whether use the case sensitive via
         (ace-jump-push-mark)
         (run-hooks 'ace-jump-mode-before-jump-hook)
         (ace-jump-jump-to aj-data))
-        (ace-jump-done)
+      (ace-jump-done)
       (run-hooks 'ace-jump-mode-end-hook))
      (t
       (ace-jump-done)
@@ -998,7 +1023,7 @@ Such as : (lambda (x) (equal x 1)) "
                                    nil
                                  (setq found (funcall pred x)))))))
 
-  
+
 
 (defadvice pop-mark (before ace-jump-pop-mark-advice)
   "When `pop-mark' is called to jump back, this advice will sync the mark ring.
@@ -1011,7 +1036,7 @@ Move the same position to the end of `ace-jump-mode-mark-ring'."
                                              (lambda (x)
                                                (and (equal (aj-position-offset x) mp)
                                                     (eq (aj-position-buffer x) cb))))))))
-            
+
 
 (defadvice pop-global-mark (before ace-jump-pop-global-mark-advice)
   "When `pop-global-mark' is called to jump back, this advice will sync the mark ring.
@@ -1029,7 +1054,7 @@ Move the aj-position with the same buffer to the end of `ace-jump-mode-mark-ring
                 (ace-jump-move-to-end-if ace-jump-mode-mark-ring
                                          (lambda (x)
                                            (eq (aj-position-buffer x) mb))))))))
-                                              
+
 
 (defun ace-jump-mode-enable-mark-sync ()
   "Enable the sync funciton between ace jump mode mark ring and emacs mark ring.
@@ -1037,7 +1062,7 @@ Move the aj-position with the same buffer to the end of `ace-jump-mode-mark-ring
 1. This function will enable the advice which activate on
 `pop-mark' and `pop-global-mark'. These advice will remove the
 same marker from `ace-jump-mode-mark-ring' when user use
-`pop-mark' or `global-pop-mark' to jump back. 
+`pop-mark' or `global-pop-mark' to jump back.
 
 2. Set variable `ace-jump-sync-emacs-mark-ring' to t, which will
 sync mark information with emacs mark ring. "
@@ -1053,7 +1078,7 @@ sync mark information with emacs mark ring. "
 1. This function will diable the advice which activate on
 `pop-mark' and `pop-global-mark'. These advice will remove the
 same marker from `ace-jump-mode-mark-ring' when user use
-`pop-mark' or `global-pop-mark' to jump back. 
+`pop-mark' or `global-pop-mark' to jump back.
 
 2. Set variable `ace-jump-sync-emacs-mark-ring' to nil, which
 will stop synchronizing mark information with emacs mark ring. "
@@ -1067,7 +1092,3 @@ will stop synchronizing mark information with emacs mark ring. "
 (provide 'ace-jump-mode)
 
 ;;; ace-jump-mode.el ends here
-
-;; Local Variables: 
-;; byte-compile-warnings: (not cl-functions) 
-;; End: 
